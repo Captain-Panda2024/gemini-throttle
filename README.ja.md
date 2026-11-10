@@ -2,7 +2,7 @@
 
 **バージョン**: 0.8
 **ライセンス**: MIT
-**著者**: mit. Panda Captain & Reika AI
+**著者**: Panda Captain & Reika AI
 
 ## 概要
 
@@ -114,7 +114,7 @@ gemini-throttle/
 
 ## ライセンス
 
-MIT License. Copyright (c) 2026 mit. Panda Captain & Reika AI.
+MIT License. Copyright (c) 2026 Panda Captain & Reika AI.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
