@@ -125,8 +125,9 @@ async def proxy(request: Request, path: str):
         if response.status_code != 429:
             resp_headers = dict(response.headers)
             # Content-Encoding を削除（クライアントの自動解凍を回避）
-            resp_headers.pop("content-encoding", None)
-            resp_headers.pop("Content-Encoding", None)
+            for h in ("content-encoding", "Content-Encoding", "content-length",
+                      "Content-Length", "transfer-encoding", "Transfer-Encoding"):
+                resp_headers.pop(h, None)
             return Response(
                 content=response.content,
                 status_code=response.status_code,
@@ -141,10 +142,19 @@ async def proxy(request: Request, path: str):
     # 最大リトライ超過
     if response is None:
         return Response(content="No response", status_code=502)
+    resp_headers = dict(response.headers)
+    # Content-Encoding を削除（body は httpx が既に解凍済みのため、
+    # ヘッダを残すとクライアント側で gzip 解凍に失敗する）
+    resp_headers.pop("content-encoding", None)
+    resp_headers.pop("Content-Encoding", None)
+    resp_headers.pop("content-length", None)
+    resp_headers.pop("Content-Length", None)
+    resp_headers.pop("transfer-encoding", None)
+    resp_headers.pop("Transfer-Encoding", None)
     return Response(
         content=response.content,
         status_code=429,
-        headers=dict(response.headers),
+        headers=resp_headers,
     )
 
 
