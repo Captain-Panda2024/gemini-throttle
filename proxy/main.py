@@ -1,6 +1,7 @@
 import os
 import re
 import time
+from datetime import datetime
 import httpx
 from fastapi import FastAPI, Request, Response
 from limiter import TokenBucket
@@ -14,6 +15,57 @@ API_KEY = os.environ.get("GOOGLE_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
 
 MAX_RETRIES = 3
 MAX_WAIT_SEC = 65
+
+# ── 日次予算ガード（2026-11-12 captain裁定「無料Geminiを使いたい」対応）──
+# Free Tier は 1日500リクエスト/モデル（RPD）。枯渇すると回復まで7時間待ちになる。
+# しかも agent ループは 1ターン=1リクエストじゃけん、cron 十数本で簡単に食い尽くす。
+# だから「上限の手前で止めて、残りを対話用に予約する」。
+#   MAX_DAILY_REQUESTS: このプロキシが1日に上流へ投げる上限（成功分のみ数える）
+#   0 以下なら無効（無制限）
+COUNTER_PATH = os.environ.get(
+    "THROTTLE_COUNTER", "/home/captain/.hermes2/profiles/main/throttle/daily_count.json")
+MAX_DAILY_REQUESTS = int(os.environ.get("THROTTLE_MAX_DAILY", "430"))
+
+
+def _today():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _read_counter():
+    import json
+    try:
+        with open(COUNTER_PATH) as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    if data.get("date") != _today():
+        data = {"date": _today(), "count": 0, "by_model": {}}
+    return data
+
+
+def _bump_counter(model: str):
+    import json
+    data = _read_counter()
+    data["count"] = int(data.get("count", 0)) + 1
+    by_model = data.setdefault("by_model", {})
+    by_model[model] = int(by_model.get(model, 0)) + 1
+    try:
+        os.makedirs(os.path.dirname(COUNTER_PATH), exist_ok=True)
+        tmp = COUNTER_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, COUNTER_PATH)
+    except Exception as e:
+        print(f"[COUNTER] write failed: {e}", flush=True)
+    return data
+
+
+def _extract_model(body: bytes) -> str:
+    import json
+    try:
+        return str(json.loads(body or b"{}").get("model") or "?")
+    except Exception:
+        return "?"
 
 
 def _join_path(*parts: str) -> str:
@@ -85,6 +137,25 @@ def estimate_tokens(text: str) -> int:
 async def proxy(request: Request, path: str):
     await limiter.consume()
 
+    body = await request.body()
+    req_model = _extract_model(body)
+
+    # 日次予算ガード: 上限に達しとったら上流を叩かず即座に429を返す。
+    # 無駄なリトライで7時間待ちの429を踏み続けるより、明示的に止める方が速い。
+    budget_used = int(_read_counter().get("count", 0))
+    if MAX_DAILY_REQUESTS > 0 and budget_used >= MAX_DAILY_REQUESTS:
+        print(f"[BUDGET] {datetime.now().isoformat(timespec='seconds')} "
+              f"blocked path=/{path} used={budget_used}/{MAX_DAILY_REQUESTS}", flush=True)
+        return Response(
+            content=(
+                '{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":'
+                f"'gemini-throttle daily budget guard: {budget_used}/{MAX_DAILY_REQUESTS} used today. "
+                "Reserved remainder for interactive use. Falling back is expected.'}}"
+            ),
+            status_code=429,
+            media_type="application/json",
+        )
+
     # パスから v1 プレフィックスを除去（upstream が v1beta/openai を含むため）
     clean_path = path
     if clean_path.startswith("v1/"):
@@ -128,6 +199,11 @@ async def proxy(request: Request, path: str):
             for h in ("content-encoding", "Content-Encoding", "content-length",
                       "Content-Length", "transfer-encoding", "Transfer-Encoding"):
                 resp_headers.pop(h, None)
+            # 消費量の会計用ログ（1リクエスト=1行・日時付き）。RPD枯渇の原因を後から数えるため。
+            stats = _bump_counter(req_model)
+            print(f"[REQ] {datetime.now().isoformat(timespec='seconds')} "
+                  f"path=/{path} status={response.status_code} attempts={attempt + 1} "
+                  f"model={req_model} today={stats.get('count')}/{MAX_DAILY_REQUESTS}", flush=True)
             return Response(
                 content=response.content,
                 status_code=response.status_code,

@@ -1,6 +1,6 @@
 # gemini-throttle
 
-**Version**: 0.8
+**Version**: 0.9-beta
 **License**: MIT
 **Author**: Panda Captain & Reika AI
 
