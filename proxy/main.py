@@ -68,6 +68,22 @@ def _extract_model(body: bytes) -> str:
         return "?"
 
 
+def _normalize_model(raw: str) -> str:
+    """モデル名の表記揺れを吸収する（予算の別勘定化を防ぐ）。
+
+    Google は `models/gemini-3.1-flash-lite` / `google/gemini-3.1-flash-lite` /
+    `gemini-3.1-flash-lite` を同じモデルとして扱うので、こちらも同一キーに寄せる。
+    接頭辞だけ落とし、未知は ? のまま。
+    """
+    if not raw or raw == "?":
+        return "?"
+    m = raw.strip()
+    for prefix in ("models/", "google/", "publishers/google/models/"):
+        if m.startswith(prefix):
+            m = m[len(prefix):]
+    return m or "?"
+
+
 def _join_path(*parts: str) -> str:
     """パス結合の正規化。/v1 /openai /v1beta の重複を畳む。"""
     segments = []
@@ -139,22 +155,30 @@ async def proxy(request: Request, path: str):
 
     body = await request.body()
     req_model = _extract_model(body)
+    counter_model = _normalize_model(req_model)  # 予算の別勘定化を防ぐ
 
     # 日次予算ガード: 上限に達しとったら上流を叩かず即座に429を返す。
-    # 無駄なリトライで7時間待ちの429を踏み続けるより、明示的に止める方が速い。
-    budget_used = int(_read_counter().get("count", 0))
-    if MAX_DAILY_REQUESTS > 0 and budget_used >= MAX_DAILY_REQUESTS:
-        print(f"[BUDGET] {datetime.now().isoformat(timespec='seconds')} "
-              f"blocked path=/{path} used={budget_used}/{MAX_DAILY_REQUESTS}", flush=True)
-        return Response(
-            content=(
-                '{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":'
-                f"'gemini-throttle daily budget guard: {budget_used}/{MAX_DAILY_REQUESTS} used today. "
-                "Reserved remainder for interactive use. Falling back is expected.'}}"
-            ),
-            status_code=429,
-            media_type="application/json",
-        )
+    # 対象は「生成呼び出し」だけ。ヘルスチェック（/v1/models, /props 等）まで
+    # 429で止めると、クライアントがリトライを繰り返して無駄に叩き続ける。
+    # 上限はモデル別（Google Free Tier の RPD がモデル単位のため）。
+    is_generate_req = "chat/completions" in path or path.endswith("/completions")
+    if is_generate_req and MAX_DAILY_REQUESTS > 0:
+        _c = _read_counter()
+        budget_used = int(_c.get("by_model", {}).get(counter_model, 0))
+        if budget_used >= MAX_DAILY_REQUESTS:
+            print(f"[BUDGET] {datetime.now().isoformat(timespec='seconds')} "
+                  f"blocked path=/{path} model={counter_model} "
+                  f"used={budget_used}/{MAX_DAILY_REQUESTS}", flush=True)
+            return Response(
+                content=(
+                    '{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":'
+                    f"'gemini-throttle daily budget guard: model {counter_model} "
+                    f"{budget_used}/{MAX_DAILY_REQUESTS} used today. "
+                    "Reserved remainder for interactive use. Falling back is expected.'}}"
+                ),
+                status_code=429,
+                media_type="application/json",
+            )
 
     # パスから v1 プレフィックスを除去（upstream が v1beta/openai を含むため）
     clean_path = path
@@ -199,11 +223,21 @@ async def proxy(request: Request, path: str):
             for h in ("content-encoding", "Content-Encoding", "content-length",
                       "Content-Length", "transfer-encoding", "Transfer-Encoding"):
                 resp_headers.pop(h, None)
-            # 消費量の会計用ログ（1リクエスト=1行・日時付き）。RPD枯渇の原因を後から数えるため。
-            stats = _bump_counter(req_model)
+            # 予算の会計は「生成の成功」だけ数える。
+            # ヘルスチェックの404やクライアント切断の503まで数えると、
+            # 実際のAIリクエストが120件でも予算が430に達して無駄に枯渇する。
+            is_generate = "chat/completions" in path or path.endswith("/completions")
+            counted = is_generate and response.status_code == 200
+            if counted:
+                stats = _bump_counter(counter_model)
+                today = stats.get("count")
+            else:
+                stats = _read_counter()
+                today = stats.get("count")
             print(f"[REQ] {datetime.now().isoformat(timespec='seconds')} "
                   f"path=/{path} status={response.status_code} attempts={attempt + 1} "
-                  f"model={req_model} today={stats.get('count')}/{MAX_DAILY_REQUESTS}", flush=True)
+                  f"model={counter_model} today={today}/{MAX_DAILY_REQUESTS} "
+                  f"counted={1 if counted else 0}", flush=True)
             return Response(
                 content=response.content,
                 status_code=response.status_code,
@@ -212,7 +246,8 @@ async def proxy(request: Request, path: str):
 
         # 429: 待機して再試行
         wait_sec = parse_retry_window(response)
-        print(f"[429] attempt={attempt + 1}/{MAX_RETRIES} wait={wait_sec}s")
+        print(f"[429] {datetime.now().isoformat(timespec='seconds')} "
+              f"attempt={attempt + 1}/{MAX_RETRIES} wait={wait_sec}s", flush=True)
         await asyncio.sleep(wait_sec)
 
     # 最大リトライ超過
